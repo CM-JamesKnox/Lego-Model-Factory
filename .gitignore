@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+venv/
+
+# Generated datasets and models (large binary files)
+datasets/raw/
+datasets/yolo/
+# models/
+
+# HDRI maps
+hdri/*.hdr
+hdri/*.exr
+
+# Blender temp files
+*.blend1
+*.blend
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# YOLO runs
+runs/
+
+# Streamlit cache
+.streamlit/
