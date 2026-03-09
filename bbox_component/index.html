@@ -12,7 +12,9 @@ canvas { display: block; max-width: 100%; }
 <canvas id="c"></canvas>
 <script>
 const send = (type, payload) =>
-    window.parent.postMessage(Object.assign({type}, payload), "*");
+    window.parent.postMessage(
+        Object.assign({isStreamlitMessage: true, type}, payload), "*"
+    );
 
 const setHeight = (h) => send("streamlit:setFrameHeight", {height: h});
 const setValue  = (v) => send("streamlit:setComponentValue", {value: v, dataType: "json"});
@@ -23,11 +25,12 @@ const ctx    = canvas.getContext("2d");
 const HR     = 8;   // handle radius px
 const MIN_P  = 1.5; // min box size in %
 
-let imgEl   = null;
-let box     = {x1: 5, y1: 5, x2: 95, y2: 95};
-let drag    = null;
-let mStart  = null;
-let bStart  = null;
+let imgEl      = null;
+let box        = {x1: 5, y1: 5, x2: 95, y2: 95};
+let drag       = null;
+let mStart     = null;
+let bStart     = null;
+let firstRender = true;  // only accept box from Streamlit on first render
 
 // % → canvas px
 const cx = p => p / 100 * canvas.width;
@@ -108,45 +111,58 @@ function evPos(e) {
     return {x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy};
 }
 
-canvas.addEventListener("mousemove", e => {
-    const {x, y} = evPos(e);
-    if (!drag) { canvas.style.cursor = getCursor(x, y); return; }
-
+function applyDrag(x, y) {
     const dx = px(x - mStart.x), dy = py(y - mStart.y);
     const b  = {...bStart};
-
     if (drag === "move") {
         const w = b.x2 - b.x1, h = b.y2 - b.y1;
         b.x1 = clamp(b.x1 + dx, 0, 100 - w);
         b.y1 = clamp(b.y1 + dy, 0, 100 - h);
         b.x2 = b.x1 + w; b.y2 = b.y1 + h;
     } else {
-        if (drag.includes("l")) b.x1 = clamp(b.x1+dx, 0,       b.x2-MIN_P);
+        if (drag.includes("l")) b.x1 = clamp(b.x1+dx, 0,        b.x2-MIN_P);
         if (drag.includes("r")) b.x2 = clamp(b.x2+dx, b.x1+MIN_P, 100);
-        if (drag.includes("t")) b.y1 = clamp(b.y1+dy, 0,       b.y2-MIN_P);
+        if (drag.includes("t")) b.y1 = clamp(b.y1+dy, 0,        b.y2-MIN_P);
         if (drag.includes("b")) b.y2 = clamp(b.y2+dy, b.y1+MIN_P, 100);
     }
     Object.assign(box, b);
     draw();
+}
+
+// Cursor feedback on hover (canvas only)
+canvas.addEventListener("mousemove", e => {
+    if (drag) return;
+    const {x, y} = evPos(e);
+    canvas.style.cursor = getCursor(x, y);
 });
 
 canvas.addEventListener("mousedown", e => {
     const {x, y} = evPos(e);
-    drag   = hitTest(x, y);
+    const hit = hitTest(x, y);
+    if (!hit) return;
+    drag   = hit;
     mStart = {x, y};
     bStart = {...box};
     e.preventDefault();
+    // Track globally so drag works outside the canvas
+    document.addEventListener("mousemove", docMove);
+    document.addEventListener("mouseup",   docUp);
 });
 
-function commitDrag() {
+function docMove(e) {
+    if (!drag) return;
+    applyDrag(evPos(e).x, evPos(e).y);
+}
+
+function docUp(e) {
+    document.removeEventListener("mousemove", docMove);
+    document.removeEventListener("mouseup",   docUp);
     if (!drag) return;
     drag = null;
     setValue({x1:round1(box.x1), y1:round1(box.y1), x2:round1(box.x2), y2:round1(box.y2)});
 }
-canvas.addEventListener("mouseup",    commitDrag);
-canvas.addEventListener("mouseleave", commitDrag);
 
-// touch passthrough
+// Touch passthrough
 function touchEv(type, e) {
     const t = e.touches[0] || e.changedTouches[0];
     canvas.dispatchEvent(new MouseEvent(type, {clientX:t.clientX, clientY:t.clientY, bubbles:true}));
@@ -161,7 +177,11 @@ window.addEventListener("message", e => {
     if (!e.data || e.data.type !== "streamlit:render") return;
     const args = e.data.args || {};
 
-    if (args.box) box = {...args.box};
+    // Only take the box value from Streamlit on the first render.
+    // On subsequent reruns Streamlit sends a stale box (session state not yet
+    // updated) which would snap the box back — so we ignore it after init.
+    if (firstRender && args.box) box = {...args.box};
+    firstRender = false;
 
     if (args.img_b64) {
         imgEl = new Image();

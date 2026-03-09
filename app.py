@@ -41,8 +41,32 @@ DATASET_YAML  = PROJECT_ROOT / "dataset.yaml"
 for d in (DATASETS_RAW, DATASETS_YOLO, REAL_IMAGES_DIR, MODELS_DIR, HDRI_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+@st.cache_resource
+def _start_bbox_server():
+    """Serve bbox_component over a plain HTTP server to avoid path-with-spaces issues."""
+    import socket
+    from http.server import HTTPServer, SimpleHTTPRequestHandler
+    _comp_dir = str(PROJECT_ROOT / "bbox_component")
+    with socket.socket() as _s:
+        _s.bind(("", 0))
+        _port = _s.getsockname()[1]
+    class _H(SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=_comp_dir, **kw)
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            super().end_headers()
+        def log_message(self, *a, **kw): pass
+    threading.Thread(
+        target=HTTPServer(("localhost", _port), _H).serve_forever,
+        daemon=True,
+    ).start()
+    return _port
+
 _bbox_editor = components.declare_component(
-    "bbox_editor", path=str(PROJECT_ROOT / "bbox_component")
+    "bbox_editor", url=f"http://localhost:{_start_bbox_server()}"
 )
 
 # ---------------------------------------------------------------------------
@@ -518,7 +542,9 @@ with tab_train:
     train_log = st.empty()
 
     if start_train:
-        st.session_state["train_running"] = True
+        st.session_state["train_running"]   = True
+        st.session_state["train_log_lines"] = []
+        st.session_state["train_status"]    = "running"
         cmd = [
             "yolo", "train",
             f"model={base_model}",
@@ -529,7 +555,6 @@ with tab_train:
             f"project={MODELS_DIR}",
             f"name={model_name}",
         ]
-        log_lines = []
 
         def _run_training():
             proc = subprocess.Popen(
@@ -537,19 +562,27 @@ with tab_train:
                 text=True, bufsize=1
             )
             for raw in proc.stdout:
-                log_lines.append(raw.rstrip())
-                if len(log_lines) > 100:
-                    log_lines.pop(0)
-                train_log.code("\n".join(log_lines))
+                # Thread only writes to session state — no Streamlit UI calls
+                lines = st.session_state["train_log_lines"]
+                lines.append(raw.rstrip())
+                if len(lines) > 200:
+                    lines.pop(0)
             proc.wait()
             st.session_state["train_running"] = False
-            if proc.returncode == 0:
-                st.session_state["train_status"] = "done"
-            else:
-                st.session_state["train_status"] = f"error {proc.returncode}"
+            st.session_state["train_status"] = (
+                "done" if proc.returncode == 0 else f"error {proc.returncode}"
+            )
 
         threading.Thread(target=_run_training, daemon=True).start()
         st.rerun()
+
+    # Display live log — main thread polls session state while training runs
+    if st.session_state.get("train_running") or st.session_state.get("train_log_lines"):
+        _lines = st.session_state.get("train_log_lines", [])
+        train_log.code("\n".join(_lines) if _lines else "Starting…")
+        if st.session_state.get("train_running"):
+            time.sleep(1)
+            st.rerun()
 
     if st.session_state.get("train_status") == "done":
         best = list(MODELS_DIR.glob(f"**/{model_name}/weights/best.pt"))
@@ -942,3 +975,35 @@ with tab_boost:
                     st.session_state["boost_skipped"] += 1
                     st.session_state["boost_idx"]     += 1
                     st.rerun()
+
+    # --- Review labeled images ---
+    if boost_part_id:
+        _rev_img_dir = REAL_IMAGES_DIR / boost_part_id / "images"
+        _rev_lbl_dir = REAL_IMAGES_DIR / boost_part_id / "labels"
+        _rev_imgs = sorted(_rev_img_dir.glob("*")) if _rev_img_dir.exists() else []
+        if _rev_imgs:
+            st.divider()
+            st.subheader(f"Labeled images — {boost_part_id} ({len(_rev_imgs)} saved)")
+            _cols = st.columns(3)
+            for _ri, _rp in enumerate(_rev_imgs):
+                _rlbl = _rev_lbl_dir / (_rp.stem + ".txt")
+                try:
+                    _rim = Image.open(str(_rp)).convert("RGB")
+                    _rw, _rh = _rim.size
+                    if _rlbl.exists():
+                        _draw = ImageDraw.Draw(_rim)
+                        for _line in _rlbl.read_text().splitlines():
+                            _parts = _line.strip().split()
+                            if len(_parts) == 5:
+                                _, _xc, _yc, _nw, _nh = map(float, _parts)
+                                _rx1 = int((_xc - _nw / 2) * _rw)
+                                _ry1 = int((_yc - _nh / 2) * _rh)
+                                _rx2 = int((_xc + _nw / 2) * _rw)
+                                _ry2 = int((_yc + _nh / 2) * _rh)
+                                _lw  = max(3, _rw // 150)
+                                _draw.rectangle([_rx1, _ry1, _rx2, _ry2],
+                                                outline="red", width=_lw)
+                    with _cols[_ri % 3]:
+                        st.image(_rim, caption=_rp.name, use_container_width=True)
+                except Exception:
+                    pass

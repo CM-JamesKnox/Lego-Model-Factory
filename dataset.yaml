@@ -1,8 +1,11 @@
 names:
 - '3001'
 - '3002'
+- '3003'
+- '3020'
 - '3021'
-nc: 3
+- '3022'
+nc: 6
 path: C:\Users\James\Documents\Lego-Yolo Training\datasets\yolo
 train: images/train
 val: images/val
