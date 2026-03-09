@@ -195,110 +195,110 @@ with tab_gen:
     parts_map = load_parts_map()
 
     if not parts_map:
-        st.error(f"No .dat files found in `{LDRAW_PARTS}`. "
-                 "Check that Studio 2.0 is installed and LDRAW_PARTS is correct.")
-        st.stop()
+        st.warning(f"No .dat files found in `{LDRAW_PARTS}`. "
+                   "Check that Studio 2.0 is installed and LDRAW_PARTS is correct. "
+                   "The Generate tab is disabled, but other tabs still work.")
+    else:
+        col_left, col_right = st.columns([2, 1])
 
-    col_left, col_right = st.columns([2, 1])
+        with col_left:
+            # Search box to filter the multi-select list
+            search_term = st.text_input("Filter parts (ID or description)",
+                                        placeholder="e.g. brick, 3001, plate…")
+            filtered = {
+                pid: desc for pid, desc in parts_map.items()
+                if search_term.lower() in pid.lower()
+                or search_term.lower() in desc.lower()
+            } if search_term else parts_map
 
-    with col_left:
-        # Search box to filter the multi-select list
-        search_term = st.text_input("Filter parts (ID or description)",
-                                    placeholder="e.g. brick, 3001, plate…")
-        filtered = {
-            pid: desc for pid, desc in parts_map.items()
-            if search_term.lower() in pid.lower()
-            or search_term.lower() in desc.lower()
-        } if search_term else parts_map
+            selected_parts = st.multiselect(
+                f"Select parts ({len(filtered):,} shown)",
+                options=list(filtered.keys()),
+                format_func=lambda x: f"{x}  —  {parts_map.get(x, '')}",
+                placeholder="Type to search, then select…",
+            )
 
-        selected_parts = st.multiselect(
-            f"Select parts ({len(filtered):,} shown)",
-            options=list(filtered.keys()),
-            format_func=lambda x: f"{x}  —  {parts_map.get(x, '')}",
-            placeholder="Type to search, then select…",
-        )
+        with col_right:
+            gen_count = st.slider("Images per part", 50, 500, 100, 10)
+            resolution = st.selectbox("Resolution", ["640x640", "1280x1280", "320x320"])
+            cycles_samples = st.slider("Cycles samples (quality vs speed)", 32, 256, 96, 16)
+            out_dir = st.text_input("Output directory", str(DATASETS_RAW))
+            hdri_path = st.text_input("HDRI directory (optional)", str(HDRI_DIR))
 
-    with col_right:
-        gen_count = st.slider("Images per part", 50, 500, 100, 10)
-        resolution = st.selectbox("Resolution", ["640x640", "1280x1280", "320x320"])
-        cycles_samples = st.slider("Cycles samples (quality vs speed)", 32, 256, 96, 16)
-        out_dir = st.text_input("Output directory", str(DATASETS_RAW))
-        hdri_path = st.text_input("HDRI directory (optional)", str(HDRI_DIR))
+        st.divider()
 
-    st.divider()
+        # State init
+        for key, val in [
+            ("gen_running", False), ("gen_progress", 0.0),
+            ("gen_status", ""), ("gen_proc", None), ("gen_count", gen_count),
+            ("gen_log", ""),
+        ]:
+            if key not in st.session_state:
+                st.session_state[key] = val
 
-    # State init
-    for key, val in [
-        ("gen_running", False), ("gen_progress", 0.0),
-        ("gen_status", ""), ("gen_proc", None), ("gen_count", gen_count),
-        ("gen_log", ""),
-    ]:
-        if key not in st.session_state:
-            st.session_state[key] = val
+        st.session_state["gen_count"] = gen_count
 
-    st.session_state["gen_count"] = gen_count
+        col_btn, col_stop = st.columns([1, 1])
 
-    col_btn, col_stop = st.columns([1, 1])
+        with col_btn:
+            start = st.button("Generate", type="primary",
+                              disabled=st.session_state["gen_running"] or not selected_parts)
 
-    with col_btn:
-        start = st.button("Generate", type="primary",
-                          disabled=st.session_state["gen_running"] or not selected_parts)
+        with col_stop:
+            if st.button("Stop", disabled=not st.session_state["gen_running"]):
+                proc = st.session_state.get("gen_proc")
+                if proc:
+                    proc.terminate()
+                st.session_state["gen_running"] = False
 
-    with col_stop:
-        if st.button("Stop", disabled=not st.session_state["gen_running"]):
-            proc = st.session_state.get("gen_proc")
-            if proc:
-                proc.terminate()
-            st.session_state["gen_running"] = False
+        progress_bar = st.progress(st.session_state["gen_progress"])
+        status_text  = st.empty()
+        log_box      = st.empty()
 
-    progress_bar = st.progress(st.session_state["gen_progress"])
-    status_text  = st.empty()
-    log_box      = st.empty()
+        if start and selected_parts:
+            st.session_state["gen_running"] = True
+            st.session_state["gen_progress"] = 0.0
+            st.session_state["gen_status"]   = "running"
 
-    if start and selected_parts:
-        st.session_state["gen_running"] = True
-        st.session_state["gen_progress"] = 0.0
-        st.session_state["gen_status"]   = "running"
+            cmd = [
+                BLENDER_EXE, "--background", "--python",
+                str(PROJECT_ROOT / "blender_gen.py"), "--",
+                "--parts",      ",".join(selected_parts),
+                "--count",      str(gen_count),
+                "--output",     out_dir,
+                "--ldraw",      LDRAW_ROOT,
+                "--resolution", resolution,
+                "--samples",    str(cycles_samples),
+            ]
+            if os.path.isdir(hdri_path):
+                cmd += ["--hdri_dir", hdri_path]
 
-        cmd = [
-            BLENDER_EXE, "--background", "--python",
-            str(PROJECT_ROOT / "blender_gen.py"), "--",
-            "--parts",      ",".join(selected_parts),
-            "--count",      str(gen_count),
-            "--output",     out_dir,
-            "--ldraw",      LDRAW_ROOT,
-            "--resolution", resolution,
-            "--samples",    str(cycles_samples),
-        ]
-        if os.path.isdir(hdri_path):
-            cmd += ["--hdri_dir", hdri_path]
+            st.session_state["gen_log"] = ""
+            t = threading.Thread(
+                target=stream_subprocess,
+                args=(cmd, selected_parts),
+                daemon=True,
+            )
+            t.start()
+            st.rerun()
 
-        st.session_state["gen_log"] = ""
-        t = threading.Thread(
-            target=stream_subprocess,
-            args=(cmd, selected_parts),
-            daemon=True,
-        )
-        t.start()
-        st.rerun()
-
-    # Main thread renders whatever the background thread wrote to session_state
-    if st.session_state["gen_running"]:
-        progress_bar.progress(st.session_state["gen_progress"])
-        status_text.info(f"Rendering… {st.session_state['gen_progress']:.1%} complete")
-        if st.session_state["gen_log"]:
-            log_box.code(st.session_state["gen_log"])
-        time.sleep(0.5)
-        st.rerun()
-    elif st.session_state["gen_status"] == "done":
-        progress_bar.progress(1.0)
-        status_text.success("Generation complete!")
-        if st.session_state["gen_log"]:
-            log_box.code(st.session_state["gen_log"])
-    elif st.session_state["gen_status"].startswith("error"):
-        status_text.error(f"Blender exited with: {st.session_state['gen_status']}")
-        if st.session_state["gen_log"]:
-            log_box.code(st.session_state["gen_log"])
+        # Main thread renders whatever the background thread wrote to session_state
+        if st.session_state["gen_running"]:
+            progress_bar.progress(st.session_state["gen_progress"])
+            status_text.info(f"Rendering… {st.session_state['gen_progress']:.1%} complete")
+            if st.session_state["gen_log"]:
+                log_box.code(st.session_state["gen_log"])
+            time.sleep(0.5)
+            st.rerun()
+        elif st.session_state["gen_status"] == "done":
+            progress_bar.progress(1.0)
+            status_text.success("Generation complete!")
+            if st.session_state["gen_log"]:
+                log_box.code(st.session_state["gen_log"])
+        elif st.session_state["gen_status"].startswith("error"):
+            status_text.error(f"Blender exited with: {st.session_state['gen_status']}")
+            if st.session_state["gen_log"]:
+                log_box.code(st.session_state["gen_log"])
 
 
 # ---------------------------------------------------------------------------
