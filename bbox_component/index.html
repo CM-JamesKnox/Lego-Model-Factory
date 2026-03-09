@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: transparent; overflow: hidden; user-select: none; }
+canvas { display: block; max-width: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const send = (type, payload) =>
+    window.parent.postMessage(Object.assign({type}, payload), "*");
+
+const setHeight = (h) => send("streamlit:setFrameHeight", {height: h});
+const setValue  = (v) => send("streamlit:setComponentValue", {value: v, dataType: "json"});
+const ready     = ()  => send("streamlit:componentReady",   {apiVersion: 1});
+
+const canvas = document.getElementById("c");
+const ctx    = canvas.getContext("2d");
+const HR     = 8;   // handle radius px
+const MIN_P  = 1.5; // min box size in %
+
+let imgEl   = null;
+let box     = {x1: 5, y1: 5, x2: 95, y2: 95};
+let drag    = null;
+let mStart  = null;
+let bStart  = null;
+
+// % → canvas px
+const cx = p => p / 100 * canvas.width;
+const cy = p => p / 100 * canvas.height;
+// canvas px → %
+const px = c => c / canvas.width  * 100;
+const py = c => c / canvas.height * 100;
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const round1 = v => Math.round(v * 10) / 10;
+
+function handles() {
+    const {x1, y1, x2, y2} = {x1:cx(box.x1),y1:cy(box.y1),x2:cx(box.x2),y2:cy(box.y2)};
+    const xm = (x1+x2)/2, ym = (y1+y2)/2;
+    return [
+        {id:"tl", x:x1, y:y1, cur:"nwse-resize"},
+        {id:"tr", x:x2, y:y1, cur:"nesw-resize"},
+        {id:"bl", x:x1, y:y2, cur:"nesw-resize"},
+        {id:"br", x:x2, y:y2, cur:"nwse-resize"},
+        {id:"tm", x:xm, y:y1, cur:"ns-resize"},
+        {id:"bm", x:xm, y:y2, cur:"ns-resize"},
+        {id:"ml", x:x1, y:ym, cur:"ew-resize"},
+        {id:"mr", x:x2, y:ym, cur:"ew-resize"},
+    ];
+}
+
+function hitTest(mx, my) {
+    for (const h of handles())
+        if (Math.hypot(mx - h.x, my - h.y) <= HR * 1.6) return h.id;
+    const {x1,y1,x2,y2} = {x1:cx(box.x1),y1:cy(box.y1),x2:cx(box.x2),y2:cy(box.y2)};
+    if (mx>x1 && mx<x2 && my>y1 && my<y2) return "move";
+    return null;
+}
+
+function getCursor(mx, my) {
+    for (const h of handles())
+        if (Math.hypot(mx - h.x, my - h.y) <= HR * 1.6) return h.cur;
+    const {x1,y1,x2,y2} = {x1:cx(box.x1),y1:cy(box.y1),x2:cx(box.x2),y2:cy(box.y2)};
+    if (mx>x1 && mx<x2 && my>y1 && my<y2) return "move";
+    return "crosshair";
+}
+
+function draw() {
+    if (!imgEl) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height);
+
+    const {x1,y1,x2,y2} = {x1:cx(box.x1),y1:cy(box.y1),x2:cx(box.x2),y2:cy(box.y2)};
+
+    // dim outside
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0,         canvas.width,           y1);
+    ctx.fillRect(0, y2,        canvas.width,            canvas.height - y2);
+    ctx.fillRect(0, y1,        x1,                      y2 - y1);
+    ctx.fillRect(x2, y1,       canvas.width - x2,       y2 - y1);
+
+    // box outline
+    ctx.strokeStyle = "#FF2222";
+    ctx.lineWidth   = 2.5;
+    ctx.strokeRect(x1, y1, x2-x1, y2-y1);
+
+    // handles
+    for (const h of handles()) {
+        ctx.beginPath();
+        ctx.arc(h.x, h.y, HR, 0, Math.PI * 2);
+        ctx.fillStyle   = "#FF2222";
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+    }
+}
+
+function evPos(e) {
+    const r = canvas.getBoundingClientRect();
+    const sx = canvas.width  / r.width;
+    const sy = canvas.height / r.height;
+    return {x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy};
+}
+
+canvas.addEventListener("mousemove", e => {
+    const {x, y} = evPos(e);
+    if (!drag) { canvas.style.cursor = getCursor(x, y); return; }
+
+    const dx = px(x - mStart.x), dy = py(y - mStart.y);
+    const b  = {...bStart};
+
+    if (drag === "move") {
+        const w = b.x2 - b.x1, h = b.y2 - b.y1;
+        b.x1 = clamp(b.x1 + dx, 0, 100 - w);
+        b.y1 = clamp(b.y1 + dy, 0, 100 - h);
+        b.x2 = b.x1 + w; b.y2 = b.y1 + h;
+    } else {
+        if (drag.includes("l")) b.x1 = clamp(b.x1+dx, 0,       b.x2-MIN_P);
+        if (drag.includes("r")) b.x2 = clamp(b.x2+dx, b.x1+MIN_P, 100);
+        if (drag.includes("t")) b.y1 = clamp(b.y1+dy, 0,       b.y2-MIN_P);
+        if (drag.includes("b")) b.y2 = clamp(b.y2+dy, b.y1+MIN_P, 100);
+    }
+    Object.assign(box, b);
+    draw();
+});
+
+canvas.addEventListener("mousedown", e => {
+    const {x, y} = evPos(e);
+    drag   = hitTest(x, y);
+    mStart = {x, y};
+    bStart = {...box};
+    e.preventDefault();
+});
+
+function commitDrag() {
+    if (!drag) return;
+    drag = null;
+    setValue({x1:round1(box.x1), y1:round1(box.y1), x2:round1(box.x2), y2:round1(box.y2)});
+}
+canvas.addEventListener("mouseup",    commitDrag);
+canvas.addEventListener("mouseleave", commitDrag);
+
+// touch passthrough
+function touchEv(type, e) {
+    const t = e.touches[0] || e.changedTouches[0];
+    canvas.dispatchEvent(new MouseEvent(type, {clientX:t.clientX, clientY:t.clientY, bubbles:true}));
+    e.preventDefault();
+}
+canvas.addEventListener("touchstart",  e => touchEv("mousedown", e), {passive:false});
+canvas.addEventListener("touchmove",   e => touchEv("mousemove", e), {passive:false});
+canvas.addEventListener("touchend",    e => touchEv("mouseup",   e), {passive:false});
+
+// Streamlit → component messages
+window.addEventListener("message", e => {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    const args = e.data.args || {};
+
+    if (args.box) box = {...args.box};
+
+    if (args.img_b64) {
+        imgEl = new Image();
+        imgEl.onload = () => {
+            const maxW = Math.min(680, (window.innerWidth || 700) - 20);
+            canvas.width  = maxW;
+            canvas.height = Math.round(imgEl.naturalHeight * maxW / imgEl.naturalWidth);
+            setHeight(canvas.height + 12);
+            draw();
+        };
+        imgEl.src = "data:image/jpeg;base64," + args.img_b64;
+    } else {
+        draw();
+    }
+});
+
+ready();
+</script>
+</body>
+</html>

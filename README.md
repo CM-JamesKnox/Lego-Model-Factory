@@ -63,3 +63,10 @@ The app will open in your browser at `http://localhost:8501`.
 ├── datasets/           # Generated raw and YOLO-formatted data (gitignored)
 └── hdri/               # HDRI environment maps (gitignored)
 ```
+
+## James' Notes For Improving the Model
+
+- More lighting randomisation in the renders.
+- Negative Samples (images without brick in it)
+- Real images from web
+- Greyscale image

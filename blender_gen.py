@@ -51,6 +51,9 @@ def parse_args():
                         help="Directory containing .hdr/.exr files (optional)")
     parser.add_argument("--samples",    type=int, default=96,
                         help="Cycles render samples (lower = faster)")
+    parser.add_argument("--device_type", default="AUTO",
+                        choices=["AUTO", "OPTIX", "CUDA", "HIP", "METAL", "CPU"],
+                        help="GPU backend: AUTO tries OptiX→CUDA→HIP→Metal then CPU")
     return parser.parse_args(argv)
 
 
@@ -376,6 +379,30 @@ def clear_scene():
             bpy.data.images.remove(block)
 
 
+def clear_scene_keep_lego(lego_objs: list):
+    """
+    Remove everything EXCEPT the LEGO part objects.
+    Used between renders of the same part to avoid re-importing geometry —
+    the mesh/BVH stays in VRAM and GPU utilisation stays high.
+    """
+    lego_set = set(lego_objs)
+    for obj in list(bpy.data.objects):
+        if obj not in lego_set:
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for block in list(bpy.data.lights):
+        if block.users == 0:
+            bpy.data.lights.remove(block)
+    for block in list(bpy.data.cameras):
+        if block.users == 0:
+            bpy.data.cameras.remove(block)
+    for block in list(bpy.data.materials):
+        if block.users == 0:
+            bpy.data.materials.remove(block)
+    for block in list(bpy.data.images):
+        if block.users == 0:
+            bpy.data.images.remove(block)
+
+
 def get_scene_bounds(objects) -> tuple[Vector, float]:
     """
     Return (center, max_radius) of all mesh objects in Blender world space.
@@ -456,6 +483,18 @@ def make_lego_material(color_rgb: tuple) -> bpy.types.Material:
     return mat
 
 
+def update_lego_material_color(mat: bpy.types.Material, color_rgb: tuple):
+    """
+    Update an existing LEGO material's base color in-place.
+    This avoids creating a new material object each frame, which would
+    trigger a full Cycles shader recompile and kill GPU utilisation.
+    """
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        r, g, b = color_rgb
+        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+
+
 def assign_material_to_all_meshes(mat: bpy.types.Material, objects):
     for obj in objects:
         if obj.type == "MESH":
@@ -464,10 +503,22 @@ def assign_material_to_all_meshes(mat: bpy.types.Material, objects):
 
 
 # ---------------------------------------------------------------------------
-# Camera
+# Camera  (create once per part, update transform each frame)
 # ---------------------------------------------------------------------------
 
-def setup_camera(center: Vector, radius: float) -> bpy.types.Object:
+def setup_camera_once(center: Vector, radius: float) -> bpy.types.Object:
+    """Create the scene camera using bpy.data (headless-safe). Call once per part."""
+    cam_data = bpy.data.cameras.new("Camera")
+    cam_data.lens = 50.0
+    cam_obj = bpy.data.objects.new("Camera", cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+    bpy.context.scene.camera = cam_obj
+    update_camera(cam_obj, center, radius)
+    return cam_obj
+
+
+def update_camera(cam_obj: bpy.types.Object, center: Vector, radius: float):
+    """Randomise camera position/rotation in-place — no object creation."""
     yaw   = random.uniform(0.0, 2 * math.pi)
     pitch = random.uniform(math.radians(5), math.radians(80))
     dist  = radius * random.uniform(3.8, 6.0)
@@ -476,25 +527,15 @@ def setup_camera(center: Vector, radius: float) -> bpy.types.Object:
     y = center.y + dist * math.cos(pitch) * math.sin(yaw)
     z = center.z + dist * math.sin(pitch)
 
-    cam_data = bpy.data.cameras.new("Camera")
-    cam_data.lens = 50.0  # 50 mm focal length — similar to phone camera
-    cam_obj  = bpy.data.objects.new("Camera", cam_data)
-    bpy.context.collection.objects.link(cam_obj)
     cam_obj.location = (x, y, z)
-
     direction = center - cam_obj.location
     cam_obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
-
-    # Random roll ±15°
     roll = random.uniform(-math.radians(15), math.radians(15))
     cam_obj.rotation_euler.rotate_axis("Z", roll)
 
-    bpy.context.scene.camera = cam_obj
-    return cam_obj
-
 
 # ---------------------------------------------------------------------------
-# Lighting (3-point randomised)
+# Lighting  (create once per part, update transforms/energy each frame)
 # ---------------------------------------------------------------------------
 
 def _point_light_at(obj, target: Vector):
@@ -503,59 +544,69 @@ def _point_light_at(obj, target: Vector):
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def setup_lighting(center: Vector, radius: float):
+def setup_lighting_once(center: Vector, radius: float) -> list:
+    """
+    Create a 3-point lighting rig using bpy.data (headless-safe, no bpy.ops).
+    Call once per part; use randomize_lighting() each frame to update values.
+    """
+    lights = []
+    for name, ltype in [("Key", "AREA"), ("Fill", "AREA"), ("Rim", "POINT")]:
+        ldata = bpy.data.lights.new(name, type=ltype)
+        lobj  = bpy.data.objects.new(name, ldata)
+        bpy.context.collection.objects.link(lobj)
+        lights.append(lobj)
+    randomize_lighting(lights, center, radius)
+    return lights
+
+
+def randomize_lighting(lights: list, center: Vector, radius: float):
+    """Update light positions/energies in-place — no object creation."""
+    key_obj, fill_obj, rim_obj = lights
     dist = radius * 3.0
+    base = (radius ** 2) * 650.0
 
-    # Scale energy with radius² (inverse-square law).
-    # At radius=0.08 m, base≈6.4 — gives sensible exposure without blowout.
-    base = (radius ** 2) * 650.0   # slightly reduced from 1000
-
-    # --- Key light (warm, upper left) ---
     key_loc = center + Vector((
-        dist * random.uniform(0.5, 1.5),
+        dist * random.uniform(0.5,  1.5),
         dist * random.uniform(-1.0, -0.3),
-        dist * random.uniform(0.5, 1.5),
+        dist * random.uniform(0.5,  1.5),
     ))
-    bpy.ops.object.light_add(type="AREA", location=key_loc)
-    key = bpy.context.active_object
-    key.name = "Key"
-    key.data.energy = base * random.uniform(0.8, 1.8)
-    key.data.size   = radius * random.uniform(2.0, 4.0)
-    key.data.color  = (1.0, random.uniform(0.88, 0.96), random.uniform(0.75, 0.90))
-    _point_light_at(key, center)
+    key_obj.location      = key_loc
+    key_obj.data.energy   = base * random.uniform(0.8, 1.8)
+    key_obj.data.size     = radius * random.uniform(2.0, 4.0)
+    key_obj.data.color    = (1.0, random.uniform(0.88, 0.96), random.uniform(0.75, 0.90))
+    _point_light_at(key_obj, center)
 
-    # --- Fill light (cool, lower right) ---
     fill_loc = center + Vector((
         dist * random.uniform(-1.5, -0.5),
-        dist * random.uniform(0.3, 1.0),
-        dist * random.uniform(-0.3, 0.5),
+        dist * random.uniform(0.3,   1.0),
+        dist * random.uniform(-0.3,  0.5),
     ))
-    bpy.ops.object.light_add(type="AREA", location=fill_loc)
-    fill = bpy.context.active_object
-    fill.name = "Fill"
-    fill.data.energy = base * random.uniform(0.2, 0.55)
-    fill.data.size   = radius * random.uniform(3.0, 6.0)
-    fill.data.color  = (random.uniform(0.78, 0.88), random.uniform(0.88, 0.96), 1.0)
-    _point_light_at(fill, center)
+    fill_obj.location     = fill_loc
+    fill_obj.data.energy  = base * random.uniform(0.2, 0.55)
+    fill_obj.data.size    = radius * random.uniform(3.0, 6.0)
+    fill_obj.data.color   = (random.uniform(0.78, 0.88), random.uniform(0.88, 0.96), 1.0)
+    _point_light_at(fill_obj, center)
 
-    # --- Rim light (behind, high) ---
     rim_loc = center + Vector((
         dist * random.uniform(-0.5, 0.5),
-        dist * random.uniform(0.8, 1.5),
-        dist * random.uniform(0.8, 1.5),
+        dist * random.uniform(0.8,  1.5),
+        dist * random.uniform(0.8,  1.5),
     ))
-    bpy.ops.object.light_add(type="POINT", location=rim_loc)
-    rim = bpy.context.active_object
-    rim.name = "Rim"
-    rim.data.energy = base * random.uniform(0.3, 0.9)
-    rim.data.color  = (1.0, 1.0, 1.0)
+    rim_obj.location     = rim_loc
+    rim_obj.data.energy  = base * random.uniform(0.3, 0.9)
+    rim_obj.data.color   = (1.0, 1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
 # Background / HDRI
 # ---------------------------------------------------------------------------
 
-def setup_background(hdri_files: list):
+def _ensure_world_nodes() -> tuple:
+    """
+    Ensure the world shader graph has the required nodes and return
+    (bg_node, env_node_or_None).  Reuses existing nodes so Cycles
+    does not recompile the world shader on every frame.
+    """
     world = bpy.context.scene.world
     if world is None:
         world = bpy.data.worlds.new("World")
@@ -563,97 +614,207 @@ def setup_background(hdri_files: list):
     world.use_nodes = True
     nodes = world.node_tree.nodes
     links = world.node_tree.links
-    nodes.clear()
 
-    bg_node = nodes.new("ShaderNodeBackground")
-    out_node = nodes.new("ShaderNodeOutputWorld")
-    links.new(bg_node.outputs["Background"], out_node.inputs["Surface"])
+    # Locate or create required nodes
+    bg_node  = nodes.get("Background")  or nodes.new("ShaderNodeBackground")
+    bg_node.name = "Background"
+    out_node = nodes.get("World Output") or nodes.new("ShaderNodeOutputWorld")
+    out_node.name = "World Output"
+
+    # Ensure Background → Output is connected
+    if not out_node.inputs["Surface"].links:
+        links.new(bg_node.outputs["Background"], out_node.inputs["Surface"])
+
+    # Optional environment texture node
+    env_node   = nodes.get("EnvTex")
+    coord_node = nodes.get("TexCoord")
+
+    if env_node is None:
+        env_node = nodes.new("ShaderNodeTexEnvironment")
+        env_node.name = "EnvTex"
+    if coord_node is None:
+        coord_node = nodes.new("ShaderNodeTexCoord")
+        coord_node.name = "TexCoord"
+    if not env_node.inputs["Vector"].links:
+        links.new(coord_node.outputs["Generated"], env_node.inputs["Vector"])
+
+    return bg_node, env_node
+
+
+def setup_background(hdri_files: list):
+    bg_node, env_node = _ensure_world_nodes()
+    nodes = bpy.context.scene.world.node_tree.nodes
+    links = bpy.context.scene.world.node_tree.links
 
     if hdri_files:
-        env_node = nodes.new("ShaderNodeTexEnvironment")
-        coord_node = nodes.new("ShaderNodeTexCoord")
         try:
-            env_node.image = bpy.data.images.load(
-                random.choice(hdri_files), check_existing=False
-            )
-            links.new(coord_node.outputs["Generated"], env_node.inputs["Vector"])
-            links.new(env_node.outputs["Color"], bg_node.inputs["Color"])
+            # Swap the image in the existing env node — no node graph rebuild
+            img_path = random.choice(hdri_files)
+            env_node.image = bpy.data.images.load(img_path, check_existing=True)
+            # Connect env → bg if not already linked
+            if not bg_node.inputs["Color"].links:
+                links.new(env_node.outputs["Color"], bg_node.inputs["Color"])
             bg_node.inputs["Strength"].default_value = random.uniform(0.5, 2.0)
             return
         except Exception as e:
             print(f"[WARN] Could not load HDRI: {e}")
 
-    # Fallback: random solid colour background
+    # Fallback: solid colour — disconnect env node so bg color is used
+    for lnk in list(bg_node.inputs["Color"].links):
+        links.remove(lnk)
     r, g, b = random.random(), random.random(), random.random()
     bg_node.inputs["Color"].default_value    = (r, g, b, 1.0)
     bg_node.inputs["Strength"].default_value = random.uniform(0.3, 1.5)
 
 
 # ---------------------------------------------------------------------------
-# Distractor objects
+# Distractor objects  (fixed pool — create once, randomise each frame)
 # ---------------------------------------------------------------------------
 
-def add_distractors(center: Vector, radius: float):
-    n_distractors = random.randint(0, 4)
-    for _ in range(n_distractors):
-        # Keep distractors well clear of the main brick
-        angle  = random.uniform(0, 2 * math.pi)
-        spread = radius * random.uniform(2.5, 6.0)
-        loc    = (
-            center.x + spread * math.cos(angle),
-            center.y + spread * math.sin(angle),
-            center.z + random.uniform(-radius, radius),
-        )
-        shape = random.choice(["cube", "uv_sphere", "cylinder"])
-        prim_fn = getattr(bpy.ops.mesh, f"primitive_{shape}_add")
-        prim_fn(location=loc)
+MAX_DISTRACTORS = 4
 
-        dist_obj = bpy.context.active_object
-        # Scale relative to brick size: 20–80% of the brick radius.
-        # Default primitives are 2 BU wide, so divide by 2 to get radius-equivalent.
-        obj_scale = radius * random.uniform(0.2, 0.8) / 1.0
-        dist_obj.scale = (obj_scale, obj_scale, obj_scale)
 
-        dist_mat = bpy.data.materials.new("Distractor")
-        dist_mat.use_nodes = True
-        dist_bsdf = dist_mat.node_tree.nodes.get("Principled BSDF")
-        if dist_bsdf:
-            dist_bsdf.inputs["Base Color"].default_value = (
-                random.random(), random.random(), random.random(), 1.0
+def setup_distractor_pool(n: int = MAX_DISTRACTORS) -> list:
+    """
+    Pre-create N distractor cube objects using bpy.data (headless-safe).
+    All start hidden. Call randomize_distractors() each frame to show/move them.
+    Using a fixed pool avoids creating/destroying mesh objects per frame, which
+    would force a top-level BVH rebuild and stall the GPU.
+    """
+    pool = []
+    for idx in range(n):
+        me = bpy.data.meshes.new(f"Distractor_{idx}")
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=1.0)
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+
+        obj = bpy.data.objects.new(f"Distractor_{idx}", me)
+        bpy.context.collection.objects.link(obj)
+
+        mat = bpy.data.materials.new(f"DistMat_{idx}")
+        mat.use_nodes = True
+        me.materials.append(mat)
+
+        obj.hide_render = True
+        pool.append(obj)
+    return pool
+
+
+def randomize_distractors(pool: list, center: Vector, radius: float):
+    """Show a random subset of the distractor pool and update their transforms."""
+    n_active = random.randint(0, len(pool))
+    for idx, obj in enumerate(pool):
+        if idx < n_active:
+            angle  = random.uniform(0, 2 * math.pi)
+            spread = radius * random.uniform(2.5, 6.0)
+            obj.location = (
+                center.x + spread * math.cos(angle),
+                center.y + spread * math.sin(angle),
+                center.z + random.uniform(-radius, radius),
             )
-            dist_bsdf.inputs["Roughness"].default_value = random.uniform(0.1, 0.9)
-        dist_obj.data.materials.clear()
-        dist_obj.data.materials.append(dist_mat)
+            s = radius * random.uniform(0.2, 0.8)
+            obj.scale = (s, s, s)
+            bsdf = obj.data.materials[0].node_tree.nodes.get("Principled BSDF")
+            if bsdf:
+                bsdf.inputs["Base Color"].default_value = (
+                    random.random(), random.random(), random.random(), 1.0
+                )
+                bsdf.inputs["Roughness"].default_value = random.uniform(0.1, 0.9)
+            obj.hide_render = False
+        else:
+            obj.hide_render = True
 
 
 # ---------------------------------------------------------------------------
 # Render settings
 # ---------------------------------------------------------------------------
 
-def configure_render(W: int, H: int, samples: int, output_path: str):
+def _setup_gpu(scene, preferred_type: str = "AUTO") -> bool:
+    """
+    Enable GPU rendering in Cycles.
+    Tries backends in performance order: OPTIX → CUDA → HIP → METAL.
+    Returns True if a GPU was successfully enabled.
+    NOTE: For reliable GPU use in headless mode, open Blender GUI once,
+    set Cycles GPU in Preferences → System, and Save Preferences.
+    """
+    try:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+    except KeyError:
+        print("[WARN] Cycles add-on not found — rendering on CPU.", flush=True)
+        return False
+
+    types_to_try = (
+        ["OPTIX", "CUDA", "HIP", "METAL"] if preferred_type == "AUTO"
+        else [preferred_type]
+    )
+
+    for dtype in types_to_try:
+        if dtype == "CPU":
+            break  # explicit CPU request — skip GPU search
+        try:
+            prefs.compute_device_type = dtype
+            prefs.get_devices()  # must be called after changing type
+
+            all_devices = list(prefs.devices)
+            print(f"[INFO] {dtype} devices found: "
+                  f"{[f'{d.name}({d.type})' for d in all_devices]}", flush=True)
+
+            gpu_devices = [d for d in all_devices if d.type != "CPU"]
+            if not gpu_devices:
+                print(f"[INFO] No GPU devices under {dtype}, trying next backend.", flush=True)
+                continue
+
+            # Enable GPU devices only (pure GPU path is fastest)
+            for d in all_devices:
+                d.use = d.type != "CPU"
+            scene.cycles.device = "GPU"
+            print(
+                f"[INFO] GPU rendering active — backend: {dtype}  "
+                f"device(s): {', '.join(d.name for d in gpu_devices)}",
+                flush=True,
+            )
+            # Save preferences so future headless runs pick up GPU automatically
+            try:
+                bpy.ops.wm.save_userpref()
+                print("[INFO] GPU preferences saved to Blender user config.", flush=True)
+            except Exception as e:
+                print(f"[INFO] Could not save prefs (non-fatal): {e}", flush=True)
+            return dtype          # ← return active backend string
+        except Exception as e:
+            print(f"[INFO] {dtype} unavailable: {e}", flush=True)
+
+    scene.cycles.device = "CPU"
+    print(
+        "[WARN] No GPU backend initialised — rendering on CPU.\n"
+        "[WARN] Fix: open Blender GUI → Edit → Preferences → System → "
+        "Cycles Render Devices → select OptiX/CUDA → Save Preferences.",
+        flush=True,
+    )
+    return "CPU"
+
+
+def configure_render(W: int, H: int, samples: int, output_path: str,
+                     gpu_backend: str = "CPU"):
     scene = bpy.context.scene
-    scene.render.engine         = "CYCLES"
     scene.render.resolution_x   = W
     scene.render.resolution_y   = H
     scene.render.image_settings.file_format = "PNG"
     scene.render.filepath       = output_path
     scene.cycles.samples        = samples
 
-    # Try GPU
-    try:
-        prefs = bpy.context.preferences.addons["cycles"].preferences
-        prefs.compute_device_type = "CUDA"
-        prefs.get_devices()
-        for device in prefs.devices:
-            device.use = True
-        scene.cycles.device = "GPU"
-    except Exception:
-        scene.cycles.device = "CPU"
+    # Reuse compiled shaders/BVH across renders — critical for GPU efficiency
+    scene.render.use_persistent_data = True
 
-    # Noise denoiser for faster clean renders
+    # Denoising: use OptiX (GPU) denoiser when available so it doesn't stall on CPU
     scene.cycles.use_denoising = True
+    try:
+        scene.cycles.denoiser = "OPTIX" if gpu_backend == "OPTIX" else "OPENIMAGEDENOISE"
+    except Exception:
+        pass  # attribute absent in older Blender builds
 
-    # Colour management — Film exposure keeps highlights from blowing out
+    # Colour management
     scene.view_settings.exposure = random.uniform(-0.5, 0.5)
     scene.view_settings.gamma    = 1.0
 
@@ -710,6 +871,11 @@ def main():
     output = os.path.abspath(args.output)
     ldraw  = os.path.abspath(args.ldraw)
 
+    # --- One-time render engine + GPU setup ---
+    scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
+    gpu_backend = _setup_gpu(scene, args.device_type)
+
     # Collect HDRI files
     hdri_files = []
     if args.hdri_dir and os.path.isdir(args.hdri_dir):
@@ -731,47 +897,53 @@ def main():
         os.makedirs(img_dir,   exist_ok=True)
         os.makedirs(label_dir, exist_ok=True)
 
+        # --- Import part ONCE per part_id ---
+        # Keeping the mesh in the scene avoids re-importing and re-building
+        # the BVH acceleration structure every frame, which is the main reason
+        # GPU utilisation is low (GPU idles while CPU rebuilds the scene).
+        clear_scene()
+        lego_objs = import_ldraw_part(dat_path, ldraw)
+        if not lego_objs:
+            print(f"[WARN] No geometry for part {part_id}", flush=True)
+            continue
+
+        normalize_part_to_unit_scale(lego_objs)
+        center, radius = get_scene_bounds(lego_objs)
+        print(f"[INFO] Part {part_id} ready — rendering {args.count} images", flush=True)
+
+        # --- Build persistent scene objects ONCE per part ---
+        # Nothing is created or destroyed between frames; only values are updated.
+        # This keeps the BVH fully cached so the GPU stays busy every render.
+        part_mat    = make_lego_material(random.choice(LEGO_COLORS))
+        assign_material_to_all_meshes(part_mat, lego_objs)
+        cam_obj     = setup_camera_once(center, radius)
+        lights      = setup_lighting_once(center, radius)
+        distractors = setup_distractor_pool()
+
+        # Set up render settings once (output path updated per-frame below)
+        configure_render(W, H, args.samples, "", gpu_backend)
+
         for i in range(args.count):
             img_name   = f"{part_id}_{i:04d}.png"
             label_name = f"{part_id}_{i:04d}.txt"
             img_path   = os.path.join(img_dir,   img_name)
             label_path = os.path.join(label_dir, label_name)
 
-            # --- Build scene ---
-            clear_scene()
-
-            lego_objs = import_ldraw_part(dat_path, ldraw)
-            if not lego_objs:
-                print(f"[WARN] No geometry for part {part_id}", flush=True)
-                continue
-
-            # Normalise to a consistent bounding radius so the camera formula
-            # works regardless of the add-on's import scale
-            normalize_part_to_unit_scale(lego_objs)
-
-            color = random.choice(LEGO_COLORS)
-            mat   = make_lego_material(color)
-            # Override whatever materials the add-on assigned with our
-            # randomised LEGO plastic (only on the LEGO part, not later distractors)
-            assign_material_to_all_meshes(mat, lego_objs)
-
-            mesh_objs = lego_objs  # alias used by get_scene_bounds below
-
-            center, radius = get_scene_bounds(mesh_objs)
-
-            cam = setup_camera(center, radius)
-            setup_lighting(center, radius)
+            # Pure in-place updates — ZERO object creation/destruction this frame
+            update_lego_material_color(part_mat, random.choice(LEGO_COLORS))
+            update_camera(cam_obj, center, radius)
+            randomize_lighting(lights, center, radius)
             setup_background(hdri_files)
-            add_distractors(center, radius)
+            randomize_distractors(distractors, center, radius)
 
-            configure_render(W, H, args.samples, img_path)
+            bpy.context.scene.render.filepath       = img_path
+            bpy.context.scene.view_settings.exposure = random.uniform(-0.5, 0.5)
 
             bpy.ops.render.render(write_still=True)
 
             # --- Label ---
             scene     = bpy.context.scene
-            # lego_objs already excludes distractors (added after this point)
-            label_str = compute_yolo_label(lego_objs, scene, cam, class_id)
+            label_str = compute_yolo_label(lego_objs, scene, cam_obj, class_id)
             if label_str:
                 with open(label_path, "w") as lf:
                     lf.write(label_str + "\n")

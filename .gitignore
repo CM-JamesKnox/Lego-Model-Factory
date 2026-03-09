@@ -4,6 +4,7 @@ venv/
 
 # Generated datasets and models (large binary files)
 datasets/raw/
+datasets/real_images/
 datasets/yolo/
 # models/
 
